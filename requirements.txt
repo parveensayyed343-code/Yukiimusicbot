@@ -1,4 +1,4 @@
-pyrogram==2.0.106
+hydrogram==0.1.4
 TgCrypto==1.2.5
 py-tgcalls==2.2.11
 python-telegram-bot==21.5
