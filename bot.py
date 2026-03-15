@@ -4,11 +4,15 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters
+    ContextTypes,
 )
 from pytgcalls import PyTgCalls
-from pytgcalls.types import MediaStream
-from pytgcalls.types import AudioQuality
+from pytgcalls.types import (
+    MediaStream,
+    AudioQuality,
+    Update as TgUpdate,
+)
+from pytgcalls.filters import filters as call_filters
 from pyrogram import Client
 from queue_manager import QueueManager
 from music_stream import MusicStream
@@ -20,19 +24,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── ENV ───────────────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
 API_ID      = int(os.getenv("API_ID", "0"))
 API_HASH    = os.getenv("API_HASH", "")
-SESSION_STR = os.getenv("SESSION_STRING", "")   # Pyrogram StringSession
+SESSION_STR = os.getenv("SESSION_STRING", "")
 OWNER_ID    = int(os.getenv("OWNER_ID", "0"))
 
-# ── Core objects ──────────────────────────────────────────────────────────────
-queue_mgr   = QueueManager()
-music_str   = MusicStream()
-db          = VCDatabase()
+queue_mgr = QueueManager()
+music_str = MusicStream()
+db        = VCDatabase()
 
-# Pyrogram userbot client (joins VC)
 userbot = Client(
     "MusicBot",
     api_id=API_ID,
@@ -42,13 +43,13 @@ userbot = Client(
 )
 
 calls = PyTgCalls(userbot)
+bot_app = None  # set in main()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def is_admin(func):
-    """Decorator: only group admins / owner can use this command."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
@@ -64,29 +65,95 @@ def is_admin(func):
     return wrapper
 
 
-async def play_next(chat_id: int, context):
-    """Play next song from queue."""
-    song = queue_mgr.next(chat_id)
-    if not song:
-        await context.bot.send_message(chat_id, "✅ Queue khatam ho gayi. Phir `/play` karo!")
+def player_kb():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⏸ Pause",   callback_data="pause"),
+            InlineKeyboardButton("⏭ Skip",    callback_data="skip"),
+            InlineKeyboardButton("⏹ Stop",    callback_data="stop"),
+        ],
+        [
+            InlineKeyboardButton("🔁 Loop",    callback_data="loop"),
+            InlineKeyboardButton("🔀 Shuffle", callback_data="shuffle"),
+            InlineKeyboardButton("📋 Queue",   callback_data="queue"),
+        ]
+    ])
+
+
+def resume_kb():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶️ Resume",  callback_data="resume"),
+            InlineKeyboardButton("⏭ Skip",    callback_data="skip"),
+            InlineKeyboardButton("⏹ Stop",    callback_data="stop"),
+        ],
+        [
+            InlineKeyboardButton("🔁 Loop",    callback_data="loop"),
+            InlineKeyboardButton("🔀 Shuffle", callback_data="shuffle"),
+            InlineKeyboardButton("📋 Queue",   callback_data="queue"),
+        ]
+    ])
+
+
+async def _start_stream(chat_id: int, song: dict, join: bool = False):
+    audio_url = await music_str.get_stream_url(song["url"])
+    stream = MediaStream(audio_url, audio_quality=AudioQuality.HIGH)
+    if join:
+        await calls.play(chat_id, stream)
+    else:
+        await calls.play(chat_id, stream)
+
+
+async def _send_now_playing(chat_id: int, song: dict):
+    if bot_app:
+        await bot_app.bot.send_message(
+            chat_id,
+            f"▶️ *Ab chal raha hai:*\n\n"
+            f"🎵 {song['title']}\n"
+            f"⏱ {song['duration']}\n"
+            f"👤 {song.get('requested_by', 'Unknown')}",
+            parse_mode="Markdown",
+            reply_markup=player_kb()
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Stream end handler — v2.2.x style using @calls.on_update
+# ─────────────────────────────────────────────────────────────────────────────
+@calls.on_update(call_filters.stream_end)
+async def stream_ended(client: PyTgCalls, update: TgUpdate):
+    chat_id = update.chat_id
+
+    if queue_mgr.is_loop(chat_id):
+        song = queue_mgr.current(chat_id)
+        if song:
+            try:
+                await _start_stream(chat_id, song)
+            except Exception as e:
+                logger.error(f"Loop error: {e}")
         return
 
-    await context.bot.send_message(
-        chat_id,
-        f"▶️ *Ab chal raha hai:*\n🎵 {song['title']}\n⏱ {song['duration']}\n👤 Requested by: {song['requested_by']}",
-        parse_mode="Markdown"
-    )
+    queue_mgr.pop(chat_id)
+    next_song = queue_mgr.current(chat_id)
 
-    try:
-        audio_url = await music_str.get_stream_url(song["url"])
-        await calls.change_stream(
-            chat_id,
-            MediaStream(audio_url, audio_quality=AudioQuality.HIGH)
-        )
-    except Exception as e:
-        logger.error(f"play_next error: {e}")
-        await asyncio.sleep(2)
-        await play_next(chat_id, context)
+    if next_song:
+        try:
+            await _start_stream(chat_id, next_song)
+            await _send_now_playing(chat_id, next_song)
+        except Exception as e:
+            logger.error(f"Auto next error: {e}")
+    else:
+        if not db.get_247(chat_id):
+            try:
+                await calls.leave_group_call(chat_id)
+            except Exception:
+                pass
+        if bot_app:
+            await bot_app.bot.send_message(
+                chat_id,
+                "✅ Queue khatam ho gayi!\n`/play` se dobara shuru karo.",
+                parse_mode="Markdown"
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,23 +162,29 @@ async def play_next(chat_id: int, context):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🎵 *MusicVC Bot — Voice Chat Music Player*\n\n"
-        "Mujhe apne group mein add karo aur `/play` se shuru karo!\n\n"
+        "Group mein add karo aur `/play` se shuru karo!\n\n"
         "*Commands:*\n"
-        "`/play <song/URL>` — Queue mein add & play karo\n"
+        "`/play <song/URL>` — Play karo\n"
         "`/skip` — Next song ⏭\n"
         "`/pause` — Pause ⏸\n"
         "`/resume` — Resume ▶️\n"
         "`/stop` — Stop & VC se niklo ⏹\n"
         "`/queue` — Queue dekho 📋\n"
-        "`/np` — Abhi kya chal raha hai 🎧\n"
-        "`/volume <1-200>` — Volume set karo 🔊\n"
-        "`/loop` — Loop on/off 🔁\n"
-        "`/shuffle` — Queue shuffle karo 🔀\n"
-        "`/clearqueue` — Queue saaf karo 🗑\n"
-        "`/247 on/off` — 24/7 mode (Admin only) 🕐\n"
+        "`/np` — Ab kya chal raha hai 🎧\n"
+        "`/volume <1-200>` — Volume 🔊\n"
+        "`/loop` — Loop toggle 🔁\n"
+        "`/shuffle` — Shuffle 🔀\n"
+        "`/clearqueue` — Queue saaf karo\n"
+        "`/247 on/off` — 24/7 mode\n"
     )
-    kb = [[InlineKeyboardButton("➕ Add to Group", url=f"https://t.me/{context.bot.username}?startgroup=true")]]
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    kb = [[InlineKeyboardButton(
+        "➕ Add to Group",
+        url=f"https://t.me/{context.bot.username}?startgroup=true"
+    )]]
+    await update.message.reply_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,11 +199,16 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.args:
-        await update.message.reply_text("❗ Usage: `/play <song name ya YouTube URL>`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❗ Usage: `/play <song name ya YouTube URL>`",
+            parse_mode="Markdown"
+        )
         return
 
     query = " ".join(context.args)
-    msg   = await update.message.reply_text(f"🔍 Dhundh raha hoon: *{query}*...", parse_mode="Markdown")
+    msg   = await update.message.reply_text(
+        f"🔍 Dhundh raha hoon: *{query}*...", parse_mode="Markdown"
+    )
 
     try:
         song_info = await music_str.search_and_get_info(query)
@@ -142,69 +220,39 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         position = queue_mgr.add(chat_id, song_info)
 
         if position == 1:
-            # Bot VC mein join karo aur play karo
-            await msg.edit_text(f"🎵 Connecting to Voice Chat...\n*{song_info['title']}*", parse_mode="Markdown")
+            await msg.edit_text(
+                f"🎵 Connecting to Voice Chat...\n*{song_info['title']}*",
+                parse_mode="Markdown"
+            )
             try:
-                audio_url = await music_str.get_stream_url(song_info["url"])
-                await calls.join_group_call(
-                    chat_id,
-                    MediaStream(audio_url, audio_quality=AudioQuality.HIGH)
-                )
+                await _start_stream(chat_id, song_info, join=True)
                 await msg.edit_text(
                     f"▶️ *Playing Now:*\n\n"
                     f"🎵 {song_info['title']}\n"
                     f"⏱ {song_info['duration']}\n"
                     f"👤 {user.first_name}",
                     parse_mode="Markdown",
-                    reply_markup=player_keyboard()
+                    reply_markup=player_kb()
                 )
             except Exception as e:
-                logger.error(f"Join VC error: {e}")
-                if "already" in str(e).lower():
-                    # Already in VC, change stream
-                    audio_url = await music_str.get_stream_url(song_info["url"])
-                    await calls.change_stream(
-                        chat_id,
-                        MediaStream(audio_url, audio_quality=AudioQuality.HIGH)
-                    )
-                    await msg.edit_text(
-                        f"▶️ *Playing Now:*\n\n🎵 {song_info['title']}\n⏱ {song_info['duration']}",
-                        parse_mode="Markdown",
-                        reply_markup=player_keyboard()
-                    )
-                else:
-                    queue_mgr.clear(chat_id)
-                    await msg.edit_text(
-                        "❌ Voice Chat mein join nahi ho saka.\n"
-                        "Pehle group mein Voice Chat shuru karo, phir `/play` karo.",
-                        parse_mode="Markdown"
-                    )
+                logger.error(f"Play error: {e}")
+                queue_mgr.clear(chat_id)
+                await msg.edit_text(
+                    "❌ Voice Chat join nahi ho saka.\n"
+                    "Group mein pehle Voice Chat start karo, phir `/play` karo.",
+                    parse_mode="Markdown"
+                )
         else:
             await msg.edit_text(
-                f"✅ *Queue mein add ho gaya!*\n\n"
+                f"✅ *Queue mein add!*\n\n"
                 f"🎵 {song_info['title']}\n"
                 f"⏱ {song_info['duration']}\n"
                 f"📋 Position: #{position}",
                 parse_mode="Markdown"
             )
     except Exception as e:
-        logger.error(f"Play error: {e}")
+        logger.error(f"Play cmd error: {e}")
         await msg.edit_text(f"❌ Error: {str(e)[:150]}")
-
-
-def player_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⏸ Pause", callback_data="pause"),
-            InlineKeyboardButton("⏭ Skip",  callback_data="skip"),
-            InlineKeyboardButton("⏹ Stop",  callback_data="stop"),
-        ],
-        [
-            InlineKeyboardButton("🔁 Loop",    callback_data="loop"),
-            InlineKeyboardButton("🔀 Shuffle", callback_data="shuffle"),
-            InlineKeyboardButton("📋 Queue",   callback_data="queue"),
-        ]
-    ])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,171 +264,139 @@ async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if queue_mgr.is_empty(chat_id):
         await update.message.reply_text("❌ Queue khaali hai.")
         return
-    await update.message.reply_text("⏭ Skipping...")
-    await play_next(chat_id, context)
+    queue_mgr.pop(chat_id)
+    next_song = queue_mgr.current(chat_id)
+    if next_song:
+        await update.message.reply_text("⏭ Skipping...")
+        try:
+            await _start_stream(chat_id, next_song)
+            await _send_now_playing(chat_id, next_song)
+        except Exception as e:
+            await update.message.reply_text(f"❌ {e}")
+    else:
+        try:
+            await calls.leave_group_call(chat_id)
+        except Exception:
+            pass
+        await update.message.reply_text("✅ Queue khatam ho gayi.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  /pause
+#  /pause  /resume  /stop
 # ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     try:
-        await calls.pause_stream(chat_id)
-        await update.message.reply_text("⏸ Music pause ho gaya.\n`/resume` se wapas chalao.", parse_mode="Markdown")
+        await calls.pause_stream(update.effective_chat.id)
+        await update.message.reply_text("⏸ Paused. `/resume` se wapas chalao.", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text(f"❌ {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  /resume
-# ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     try:
-        await calls.resume_stream(chat_id)
-        await update.message.reply_text("▶️ Music resume ho gaya!")
+        await calls.resume_stream(update.effective_chat.id)
+        await update.message.reply_text("▶️ Resumed!")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text(f"❌ {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  /stop
-# ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    queue_mgr.clear(chat_id)
     try:
-        queue_mgr.clear(chat_id)
         await calls.leave_group_call(chat_id)
-        await update.message.reply_text("⏹ Music stop ho gaya aur VC se nikal gaya.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+    except Exception:
+        pass
+    await update.message.reply_text("⏹ Stopped!")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  /queue
+#  /queue  /np  /volume  /loop  /shuffle  /clearqueue  /247
 # ─────────────────────────────────────────────────────────────────────────────
 async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     q = queue_mgr.get_queue(chat_id)
-
     if not q:
-        await update.message.reply_text("📋 Queue khaali hai. `/play` se song add karo!", parse_mode="Markdown")
+        await update.message.reply_text("📋 Queue khaali hai. `/play` se add karo!", parse_mode="Markdown")
         return
-
     text = "📋 *Current Queue:*\n\n"
     for i, song in enumerate(q[:10], 1):
         prefix = "▶️" if i == 1 else f"{i}."
         text += f"{prefix} *{song['title'][:40]}* — {song['duration']}\n"
-
     if len(q) > 10:
         text += f"\n_...aur {len(q)-10} songs_"
-
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  /np  (Now Playing)
-# ─────────────────────────────────────────────────────────────────────────────
 async def np_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    song = queue_mgr.current(chat_id)
+    song = queue_mgr.current(update.effective_chat.id)
     if not song:
         await update.message.reply_text("❌ Koi song nahi chal raha.")
         return
     await update.message.reply_text(
-        f"🎧 *Now Playing:*\n\n"
-        f"🎵 {song['title']}\n"
-        f"⏱ {song['duration']}\n"
-        f"👤 Requested by: {song['requested_by']}",
-        parse_mode="Markdown",
-        reply_markup=player_keyboard()
+        f"🎧 *Now Playing:*\n\n🎵 {song['title']}\n⏱ {song['duration']}\n👤 {song.get('requested_by','')}",
+        parse_mode="Markdown", reply_markup=player_kb()
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  /volume
-# ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def volume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("❗ Usage: `/volume <1-200>`", parse_mode="Markdown")
         return
     vol = max(1, min(200, int(context.args[0])))
     try:
-        await calls.change_volume_call(chat_id, vol)
-        await update.message.reply_text(f"🔊 Volume set to *{vol}%*", parse_mode="Markdown")
+        await calls.change_volume_call(update.effective_chat.id, vol)
+        await update.message.reply_text(f"🔊 Volume: *{vol}%*", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text(f"❌ {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  /loop
-# ─────────────────────────────────────────────────────────────────────────────
 async def loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    state = queue_mgr.toggle_loop(chat_id)
-    emoji = "🔁" if state else "➡️"
-    await update.message.reply_text(f"{emoji} Loop *{'ON' if state else 'OFF'}*", parse_mode="Markdown")
+    state = queue_mgr.toggle_loop(update.effective_chat.id)
+    await update.message.reply_text(f"🔁 Loop *{'ON' if state else 'OFF'}*", parse_mode="Markdown")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  /shuffle
-# ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def shuffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    queue_mgr.shuffle(chat_id)
+    queue_mgr.shuffle(update.effective_chat.id)
     await update.message.reply_text("🔀 Queue shuffle ho gayi!")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  /clearqueue
-# ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def clearqueue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    queue_mgr.clear(chat_id)
+    queue_mgr.clear(update.effective_chat.id)
     await update.message.reply_text("🗑 Queue saaf ho gayi!")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  /247
-# ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def mode247_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     arg = context.args[0].lower() if context.args else "on"
-    if arg == "on":
-        db.set_247(chat_id, True)
-        await update.message.reply_text(
-            "🕐 *24/7 Mode ON!*\n\nBot VC mein connected rahega, chahe queue khaali ho.",
-            parse_mode="Markdown"
-        )
-    else:
-        db.set_247(chat_id, False)
-        await update.message.reply_text("✅ 24/7 Mode OFF.")
+    db.set_247(chat_id, arg == "on")
+    await update.message.reply_text(
+        f"🕐 *24/7 Mode {'ON' if arg=='on' else 'OFF'}!*",
+        parse_mode="Markdown"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Callback buttons (inline keyboard)
+#  Inline keyboard callbacks
 # ─────────────────────────────────────────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
     data    = query.data
     user_id = query.from_user.id
 
-    # Check admin
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
         if member.status not in ("administrator", "creator") and user_id != OWNER_ID:
-            await query.answer("⛔ Sirf admins use kar sakte hain!", show_alert=True)
+            await query.answer("⛔ Sirf admins!", show_alert=True)
             return
     except Exception:
         pass
@@ -388,20 +404,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "pause":
         try:
             await calls.pause_stream(chat_id)
-            await query.edit_message_reply_markup(resume_keyboard())
+            await query.edit_message_reply_markup(resume_kb())
         except Exception as e:
-            await query.answer(f"Error: {e}", show_alert=True)
+            await query.answer(str(e)[:50], show_alert=True)
 
     elif data == "resume":
         try:
             await calls.resume_stream(chat_id)
-            await query.edit_message_reply_markup(player_keyboard())
+            await query.edit_message_reply_markup(player_kb())
         except Exception as e:
-            await query.answer(f"Error: {e}", show_alert=True)
+            await query.answer(str(e)[:50], show_alert=True)
 
     elif data == "skip":
-        await play_next(chat_id, context)
-        await query.answer("⏭ Skipped!")
+        queue_mgr.pop(chat_id)
+        next_song = queue_mgr.current(chat_id)
+        if next_song:
+            try:
+                await _start_stream(chat_id, next_song)
+                await query.edit_message_text(
+                    f"▶️ *Now Playing:*\n\n🎵 {next_song['title']}\n⏱ {next_song['duration']}",
+                    parse_mode="Markdown", reply_markup=player_kb()
+                )
+            except Exception as e:
+                await query.answer(str(e)[:50], show_alert=True)
+        else:
+            try:
+                await calls.leave_group_call(chat_id)
+            except Exception:
+                pass
+            await query.edit_message_text("✅ Queue khatam ho gayi.")
 
     elif data == "stop":
         queue_mgr.clear(chat_id)
@@ -417,7 +448,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "shuffle":
         queue_mgr.shuffle(chat_id)
-        await query.answer("🔀 Queue shuffled!")
+        await query.answer("🔀 Shuffled!")
 
     elif data == "queue":
         q = queue_mgr.get_queue(chat_id)
@@ -431,63 +462,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(text, show_alert=True)
 
 
-def resume_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("▶️ Resume", callback_data="resume"),
-            InlineKeyboardButton("⏭ Skip",   callback_data="skip"),
-            InlineKeyboardButton("⏹ Stop",   callback_data="stop"),
-        ],
-        [
-            InlineKeyboardButton("🔁 Loop",    callback_data="loop"),
-            InlineKeyboardButton("🔀 Shuffle", callback_data="shuffle"),
-            InlineKeyboardButton("📋 Queue",   callback_data="queue"),
-        ]
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PyTgCalls stream end handler → auto play next
-# ─────────────────────────────────────────────────────────────────────────────
-@calls.on_stream_end()
-async def stream_end_handler(client, update):
-    chat_id = update.chat_id
-    loop_on = queue_mgr.is_loop(chat_id)
-
-    if loop_on:
-        song = queue_mgr.current(chat_id)
-        if song:
-            try:
-                audio_url = await music_str.get_stream_url(song["url"])
-                await calls.change_stream(
-                    chat_id,
-                    MediaStream(audio_url, audio_quality=AudioQuality.HIGH)
-                )
-            except Exception as e:
-                logger.error(f"Loop replay error: {e}")
-        return
-
-    # Remove current and play next
-    queue_mgr.pop(chat_id)
-    next_song = queue_mgr.current(chat_id)
-
-    if next_song:
-        try:
-            audio_url = await music_str.get_stream_url(next_song["url"])
-            await calls.change_stream(
-                chat_id,
-                MediaStream(audio_url, audio_quality=AudioQuality.HIGH)
-            )
-        except Exception as e:
-            logger.error(f"Auto next error: {e}")
-    else:
-        if not db.get_247(chat_id):
-            try:
-                await calls.leave_group_call(chat_id)
-            except Exception:
-                pass
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Error handler
 # ─────────────────────────────────────────────────────────────────────────────
@@ -499,20 +473,21 @@ async def error_handler(update, context):
 #  Main
 # ─────────────────────────────────────────────────────────────────────────────
 async def main():
+    global bot_app
+
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN not set!")
     if not API_ID or not API_HASH:
         raise ValueError("API_ID / API_HASH not set!")
     if not SESSION_STR:
-        raise ValueError("SESSION_STRING not set! Run generate_session.py first.")
+        raise ValueError("SESSION_STRING not set!")
 
-    # Start userbot + PyTgCalls
     await userbot.start()
     await calls.start()
-    logger.info("Userbot + PyTgCalls started.")
+    logger.info("✅ Userbot + PyTgCalls started.")
 
-    # Build bot application
     app = Application.builder().token(BOT_TOKEN).build()
+    bot_app = app
 
     app.add_handler(CommandHandler("start",      start))
     app.add_handler(CommandHandler("play",       play_command))
@@ -524,4 +499,26 @@ async def main():
     app.add_handler(CommandHandler("np",         np_command))
     app.add_handler(CommandHandler("volume",     volume_command))
     app.add_handler(CommandHandler("loop",       loop_command))
-   
+    app.add_handler(CommandHandler("shuffle",    shuffle_command))
+    app.add_handler(CommandHandler("clearqueue", clearqueue_command))
+    app.add_handler(CommandHandler("247",        mode247_command))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_error_handler(error_handler)
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    logger.info("🎵 MusicVC Bot is running!")
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await userbot.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
