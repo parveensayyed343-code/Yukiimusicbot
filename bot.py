@@ -7,7 +7,8 @@ from telegram.ext import (
     ContextTypes, MessageHandler, filters
 )
 from pytgcalls import PyTgCalls
-from pytgcalls.types import MediaStream, AudioQuality
+from pytgcalls.types import MediaStream
+from pytgcalls.types import AudioQuality
 from pyrogram import Client
 from queue_manager import QueueManager
 from music_stream import MusicStream
@@ -523,4 +524,4 @@ async def main():
     app.add_handler(CommandHandler("np",         np_command))
     app.add_handler(CommandHandler("volume",     volume_command))
     app.add_handler(CommandHandler("loop",       loop_command))
-    app.add_handler(CommandHan
+   
