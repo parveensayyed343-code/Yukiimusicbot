@@ -6,13 +6,8 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes,
 )
-from pytgcalls import PyTgCalls
-from pytgcalls.types import (
-    MediaStream,
-    AudioQuality,
-    Update as TgUpdate,
-)
-from pytgcalls.filters import filters as call_filters
+from pytgcalls import PyTgCalls, idle
+from pytgcalls.types import MediaStream, AudioQuality
 from pyrogram import Client
 from queue_manager import QueueManager
 from music_stream import MusicStream
@@ -42,7 +37,7 @@ userbot = Client(
     no_updates=True,
 )
 
-calls = PyTgCalls(userbot)
+calls   = PyTgCalls(userbot)
 bot_app = None  # set in main()
 
 
@@ -95,13 +90,10 @@ def resume_kb():
     ])
 
 
-async def _start_stream(chat_id: int, song: dict, join: bool = False):
+async def _start_stream(chat_id: int, song: dict):
+    """Play song in VC — works for both first play and subsequent songs."""
     audio_url = await music_str.get_stream_url(song["url"])
-    stream = MediaStream(audio_url, audio_quality=AudioQuality.HIGH)
-    if join:
-        await calls.play(chat_id, stream)
-    else:
-        await calls.play(chat_id, stream)
+    await calls.play(chat_id, MediaStream(audio_url, AudioQuality.HIGH))
 
 
 async def _send_now_playing(chat_id: int, song: dict):
@@ -118,10 +110,10 @@ async def _send_now_playing(chat_id: int, song: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Stream end handler — v2.2.x style using @calls.on_update
+#  Stream end — @calls.on_stream_end() is the correct v2.x decorator
 # ─────────────────────────────────────────────────────────────────────────────
-@calls.on_update(call_filters.stream_end)
-async def stream_ended(client: PyTgCalls, update: TgUpdate):
+@calls.on_stream_end()
+async def stream_ended(client: PyTgCalls, update):
     chat_id = update.chat_id
 
     if queue_mgr.is_loop(chat_id):
@@ -151,7 +143,7 @@ async def stream_ended(client: PyTgCalls, update: TgUpdate):
         if bot_app:
             await bot_app.bot.send_message(
                 chat_id,
-                "✅ Queue khatam ho gayi!\n`/play` se dobara shuru karo.",
+                "✅ Queue khatam! `/play` se dobara shuru karo.",
                 parse_mode="Markdown"
             )
 
@@ -225,7 +217,7 @@ async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             try:
-                await _start_stream(chat_id, song_info, join=True)
+                await _start_stream(chat_id, song_info)
                 await msg.edit_text(
                     f"▶️ *Playing Now:*\n\n"
                     f"🎵 {song_info['title']}\n"
@@ -314,7 +306,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  /queue  /np  /volume  /loop  /shuffle  /clearqueue  /247
+#  /queue
 # ─────────────────────────────────────────────────────────────────────────────
 async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -331,6 +323,9 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  /np
+# ─────────────────────────────────────────────────────────────────────────────
 async def np_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     song = queue_mgr.current(update.effective_chat.id)
     if not song:
@@ -342,6 +337,9 @@ async def np_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  /volume
+# ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def volume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or not context.args[0].isdigit():
@@ -355,23 +353,35 @@ async def volume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {e}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  /loop
+# ─────────────────────────────────────────────────────────────────────────────
 async def loop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = queue_mgr.toggle_loop(update.effective_chat.id)
     await update.message.reply_text(f"🔁 Loop *{'ON' if state else 'OFF'}*", parse_mode="Markdown")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  /shuffle
+# ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def shuffle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     queue_mgr.shuffle(update.effective_chat.id)
     await update.message.reply_text("🔀 Queue shuffle ho gayi!")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  /clearqueue
+# ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def clearqueue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     queue_mgr.clear(update.effective_chat.id)
     await update.message.reply_text("🗑 Queue saaf ho gayi!")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  /247
+# ─────────────────────────────────────────────────────────────────────────────
 @is_admin
 async def mode247_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
