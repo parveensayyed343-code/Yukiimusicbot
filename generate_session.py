@@ -9,8 +9,8 @@ Usage:
 """
 
 import asyncio
-from pyrogram import Client
-from pyrogram.errors import SessionPasswordNeeded
+from hydrogram import Client
+
 
 
 async def generate():
