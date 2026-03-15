@@ -8,7 +8,7 @@ from telegram.ext import (
 )
 from pytgcalls import PyTgCalls, idle
 from pytgcalls.types import MediaStream, AudioQuality
-from pyrogram import Client
+from hydrogram import Client
 from queue_manager import QueueManager
 from music_stream import MusicStream
 from database import VCDatabase
